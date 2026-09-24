@@ -8,6 +8,14 @@
 #include "driver/gpio.h"
 #include <ssd1306.h>
 #include "dht11.h"
+#include "sdkconfig.h"
+
+//wifi
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "esp_wifi.h"
+
 
 // Modern ADC (ESP-IDF v5.x+)
 #include "esp_adc/adc_oneshot.h"
@@ -69,10 +77,41 @@ static QueueHandle_t bt_data_queue = NULL;
 static QueueHandle_t adc_queue = NULL;
 static QueueHandle_t gpio_evt_queue = NULL;
 
+// Protótipo antecipado da ISR
+static void gpio_isr_handler(void *arg);
+
 // Tempos de pulso padrão para servos (em microssegundos)
 // Ajuste esses valores caso o seu servo não chegue aos 180 graus exatos
 #define SERVO_MIN_PULSEWIDTH_US      500      // Equivalente a 0 graus
 #define SERVO_MAX_PULSEWIDTH_US      2500     // Equivalente a 180 graus
+
+
+
+// ============================================================
+// WIFI
+// ============================================================
+void wifi_init_sta(void)
+{
+    // Cria a interface padrão do tipo Station
+    esp_netif_create_default_wifi_sta();
+
+    // Inicializa o driver Wi-Fi com as configurações padrão
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = "NOME_DA_SUA_REDE",
+            .password = "SENHA_DA_SUA_REDE",
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_connect());
+}
+
 
 // ============================================================
 // PWM
@@ -91,9 +130,52 @@ void set_servo_angle(int angle) {
     // Converte o tempo de pulso para duty cycle (para 14 bits e 50Hz)
     // Fórmula: (pulsewidth_us / 20000_us) * (2^14 - 1)
     uint32_t duty = (pulsewidth_us * ((1 << LEDC_DUTY_RES) - 1)) / (1000000 / LEDC_FREQUENCY);
-    
+
     ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, duty);
     ledc_update_duty(LEDC_MODE, LEDC_CHANNEL);
+}
+
+static void pwm_servo_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Iniciando ciclo PWM do servo...");
+
+    while (1) {
+        ESP_LOGI(TAG, "Indo para 0 graus");
+        set_servo_angle(0);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        
+        ESP_LOGI(TAG, "Indo para 90 graus");
+        set_servo_angle(90);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        ESP_LOGI(TAG, "Indo para 180 graus");
+        set_servo_angle(180);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+
+
+static void pwm_fade_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Iniciando ciclo PWM do led...");
+
+    while (1) {
+        // Aumenta o brilho gradativamente (0 a 255)
+        for (int i = 0; i <= 255; i++) {
+            ledc_set_duty_and_update(LEDC_MODE, LEDC_CHANNEL, i, 0);
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+
+        // Diminui o brilho gradativamente (255 a 0)
+        for (int i = 255; i >= 0; i--) {
+            ledc_set_duty_and_update(LEDC_MODE, LEDC_CHANNEL, i, 0);
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    vTaskDelete(NULL);
 }
 
 void initpwd(void)
@@ -153,6 +235,53 @@ void init_uart(void)
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
     ESP_LOGI(TAG, "UART1 inicializada no BaudRate 9600!");
+}
+
+// ============================================================
+// INTERRUPÇÃO
+// ============================================================
+static void IRAM_ATTR gpio_isr_handler(void *arg)
+{
+    uint32_t gpio_num = (uint32_t) arg;
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    xQueueSendFromISR(gpio_evt_queue, &gpio_num, &xHigherPriorityTaskWoken);
+
+    if (xHigherPriorityTaskWoken) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+void init_interrupt(void)
+{
+    gpio_reset_pin(INTERRUPT_PIN);
+    gpio_set_direction(INTERRUPT_PIN, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(INTERRUPT_PIN, GPIO_PULLUP_ONLY);
+    gpio_set_intr_type(INTERRUPT_PIN, GPIO_INTR_POSEDGE);
+
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(INTERRUPT_PIN, gpio_isr_handler, (void *) INTERRUPT_PIN);
+    gpio_intr_enable(INTERRUPT_PIN);
+
+    ESP_LOGI(TAG, "Tratamento por interrupção inicializado com sucesso.");
+}
+
+static void button_task(void *pvParameters)
+{
+    uint32_t io_num;
+    uint32_t count = 0;
+    bool led_state = false;
+
+    while (1) {
+        if (xQueueReceive(gpio_evt_queue, &io_num, portMAX_DELAY)) {
+            count++;
+            led_state = !led_state;
+            gpio_set_level(LED_GPIO, led_state);
+
+            ESP_LOGI(TAG, "Interrupção confirmada no GPIO[%" PRIu32 "] | Contagem: %" PRIu32 " | LED: %s",
+                     io_num, count, led_state ? "LIGADO" : "DESLIGADO");
+        }
+    }
 }
 
 // ============================================================
@@ -309,6 +438,78 @@ static void bt_send_task(void *pvParameters)
         }
     }
 }
+/*
+// ============================================================
+// TASK 5 — Leitura do ADC (ESP-IDF v5.x - OneShot API)
+// ============================================================
+void adc_read_task(void *pvParameters)
+{
+    adc_oneshot_unit_handle_t adc1_handle;
+    adc_oneshot_unit_init_config_t init_config = {
+        .unit_id = ADC_UNIT_1,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config, &adc1_handle));
+
+    adc_oneshot_chan_config_t chan_config = {
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+        .atten    = ADC_ATTEN_DB_12,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL_0, &chan_config));
+
+    ESP_LOGI(TAG, "ADC Oneshot inicializado no ADC1 Canal 0. Iniciando leituras...");
+
+    while (1) {
+        ESP_ERROR_CHECK(adc_oneshot_read(adc1_handle, ADC_CHANNEL_0, &adc_value));
+        xQueueSend(adc_queue, &adc_value, pdMS_TO_TICKS(10));
+        ESP_LOGI(TAG, "ADC Value is %d", adc_value);
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    adc_oneshot_del_unit(adc1_handle);
+    vTaskDelete(NULL);
+}
+
+// ============================================================
+// TASK 6 — Consumidora do ADC
+// ============================================================
+void data_processing_task(void *pvParameters)
+{
+    int valor_recebido = 0;
+
+    while (1) {
+        if (xQueueReceive(adc_queue, &valor_recebido, portMAX_DELAY) == pdPASS) {
+            ESP_LOGI(TAG, "Dado retirado da fila para processamento: %d", valor_recebido);
+        }
+    }
+}
+*/
+// ============================================================
+// TASK NOVA (TASK 7) — Monitoramento de Recursos e Heap
+// ============================================================
+static void system_monitor_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "Task de monitoramento do sistema iniciada.");
+
+    while (1) {
+        uint32_t free_heap = esp_get_free_heap_size();
+        uint32_t min_free_heap = esp_get_minimum_free_heap_size();
+
+        ESP_LOGI("SYS_MONITOR", "Heap Livre: %" PRIu32 " bytes | Min Heap Histórico: %" PRIu32 " bytes",
+                 free_heap, min_free_heap);
+
+        // Se a memória cair abaixo de 20KB, gera um alerta preventivo
+        if (free_heap < 20480) {
+            ESP_LOGW("SYS_MONITOR", "Alerta: Pouca memória RAM livre no sistema!");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(5000)); // Verifica a cada 5 segundos
+    }
+
+    vTaskDelete(NULL);
+}
+
 // ============================================================
 // app_main
 // ============================================================
@@ -316,12 +517,18 @@ void app_main(void)
 {
     ESP_LOGI(TAG, "Iniciando sistema...");
 
+    #if CONFIG_FREQUENCIA_DE_INICIALIZACAO
+        printf("LED configurado no pino GPIO: %d\n", CONFIG_MY_LED_GPIO);
+    #else
+        printf("Funcionalidade desabilitada no Kconfig.\n");
+    #endif
+
     // ---- Periféricos ----
     init_ssd1306();
     init_led();
     init_uart();
     initpwd();
-    
+    init_interrupt();
 
     // ---- Filas compartilhadas ----
     dht11_queue    = xQueueCreate(5, sizeof(dht11_data_t));
@@ -339,7 +546,15 @@ void app_main(void)
     xTaskCreate(oled_task,            "oled_task",      DISPLAY_TASK_STACK,  NULL, DISPLAY_TASK_PRIO,  NULL);
     xTaskCreate(dht11_task,           "dht11_task",     SENSOR_TASK_STACK,   NULL, SENSOR_TASK_PRIO,   NULL);
     xTaskCreate(bt_send_task,         "bt_send_task",   BT_SEND_TASK_STACK,  NULL, BT_SEND_TASK_PRIO,  NULL);
-    
+    //xTaskCreate(adc_read_task,        "adc_read_task",  2048,                NULL, 5,                  NULL);
+    //xTaskCreate(data_processing_task, "proc_task",      2048,                NULL, 4,                  NULL);
+    xTaskCreate(button_task,          "button_task",    2048,                NULL, 10,                 NULL);
+    //xTaskCreate(pwm_fade_task,        "pwm_fade_task",  2048,                NULL, 5,                  NULL);
+    //xTaskCreate(pwm_servo_task,        "pwm_servo_task",  2048,                NULL, 5,                  NULL);
+
+    // Criação da nova task de monitoramento
+    xTaskCreate(system_monitor_task,  "sys_monitor",    MONITOR_TASK_STACK,  NULL, MONITOR_TASK_PRIO,  NULL);
+
     const char *msg = "Franzininho WiFi conectada via ESP-IDF!\r\n";
     uart_write_bytes(BT_UART_NUM, msg, strlen(msg));
 

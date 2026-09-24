@@ -1,3 +1,15 @@
+# Ficheiros e artefactos de compilação do ESP-IDF
 build/
 sdkconfig
 sdkconfig.old
+
+# Componentes gerados e descarregados pelo IDF Component Manager
+managed_components/
+
+# Configurações locais do editor
+.vscode/
+.idea/
+
+# Ficheiros de sistema operativo
+Thumbs.db
+.DS_Store
