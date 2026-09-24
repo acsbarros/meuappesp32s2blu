@@ -5,9 +5,11 @@
 #include "freertos/queue.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include <ssd1306.h>
 #include "dht11.h"
+#include "adxl345.h"
 
 // Modern ADC (ESP-IDF v5.x+)
 #include "esp_adc/adc_oneshot.h"
